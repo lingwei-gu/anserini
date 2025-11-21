@@ -25,9 +25,11 @@ import org.apache.parquet.hadoop.example.GroupReadSupport;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 
@@ -80,7 +82,10 @@ public class FineWebCollection extends DocumentCollection<FineWebCollection.Docu
     private boolean readerInitialized;
     private String idField;
     private String contentsField;
-    private long documentCounter = 0; // Counter for auto-generating IDs when missing
+    // Counters and buffers to support splitting each Parquet row into multiple paragraph-level documents.
+    private long rowCounter = 0; // Counts Parquet records (rows) within this segment.
+    private List<String> paragraphs = new ArrayList<>();
+    private int paragraphIndex = 0;
 
     public Segment(Path path) throws IOException {
       this(path, "id", null);
@@ -90,7 +95,7 @@ public class FineWebCollection extends DocumentCollection<FineWebCollection.Docu
       super(path);
       this.idField = idField;
       this.contentsField = contentsField;
-      this.documentCounter = 0;
+      this.rowCounter = 0;
       initializeParquetReader(path);
     }
 
@@ -118,25 +123,90 @@ public class FineWebCollection extends DocumentCollection<FineWebCollection.Docu
       }
 
       try {
-        Group record = reader.read();
-        if (record == null) {
-          atEOF = true;
-          if (reader != null) {
-            reader.close();
-          }
-          readerInitialized = false;
-          throw new NoSuchElementException("End of file reached");
+        // If we still have remaining paragraphs from the current row, emit the next one.
+        if (paragraphIndex < paragraphs.size()) {
+          String paragraph = paragraphs.get(paragraphIndex++);
+          bufferedRecord = createNewDocument(paragraph, getSegmentPath(), rowCounter - 1, paragraphIndex - 1);
+          return;
         }
 
-        bufferedRecord = createNewDocument(record, documentCounter++);
+        // Otherwise, read the next Parquet record and split its text into paragraphs.
+        while (true) {
+          Group record = reader.read();
+          if (record == null) {
+            atEOF = true;
+            if (reader != null) {
+              reader.close();
+            }
+            readerInitialized = false;
+            throw new NoSuchElementException("End of file reached");
+          }
+
+          long currentRow = rowCounter++;
+
+          String text = null;
+          try {
+            // Use contentsField if provided, otherwise default to "text".
+            String fieldName = contentsField != null ? contentsField : "text";
+            text = record.getString(fieldName, 0);
+          } catch (RuntimeException e) {
+            LOG.warn("Skipping row {} due to missing or invalid contents field: {}", currentRow, e.getMessage());
+            continue; // Try next record.
+          }
+
+          paragraphs = splitIntoParagraphs(text);
+          paragraphIndex = 0;
+
+          if (paragraphs.isEmpty()) {
+            LOG.debug("Row {} produced no non-empty paragraphs, skipping.", currentRow);
+            continue;
+          }
+
+          String paragraph = paragraphs.get(paragraphIndex++);
+          bufferedRecord = createNewDocument(paragraph, getSegmentPath(), currentRow, paragraphIndex - 1);
+          return;
+        }
       } catch (IOException e) {
         LOG.error("Error reading Parquet record", e);
         throw new NoSuchElementException("Error reading Parquet record: " + e.getMessage());
       }
     }
 
-    protected Document createNewDocument(Group record, long rowNumber) {
-      return new Document(record, idField, contentsField, getSegmentPath(), rowNumber);
+    /**
+     * Split a block of text into paragraphs. We treat one or more blank lines as a paragraph
+     * separator. Single-line texts will become a single paragraph.
+     */
+    private List<String> splitIntoParagraphs(String text) {
+      List<String> result = new ArrayList<>();
+      if (text == null) {
+        return result;
+      }
+
+      // Split on one or more blank lines.
+      String[] rawParas = text.split("\\n");
+      for (String p : rawParas) {
+        String trimmed = p.trim();
+        if (!trimmed.isEmpty()) {
+          result.add(trimmed);
+        }
+      }
+
+      // Fallback: if splitting somehow produced nothing but the original text is non-empty,
+      // keep the whole text as a single paragraph.
+      if (result.isEmpty()) {
+        String trimmed = text.trim();
+        if (!trimmed.isEmpty()) {
+          result.add(trimmed);
+        }
+      }
+
+      return result;
+    }
+
+    protected Document createNewDocument(String paragraph, Path segmentPath, long rowNumber, int paragraphNumber) {
+      String segmentName = segmentPath != null ? segmentPath.getFileName().toString().replace(".parquet", "") : "doc";
+      String id = segmentName + "_" + rowNumber + "_" + paragraphNumber;
+      return new Document(id, paragraph);
     }
   }
 
@@ -149,165 +219,16 @@ public class FineWebCollection extends DocumentCollection<FineWebCollection.Docu
     private String raw;
     private Map<String, String> fields;
 
-    public Document(Group record, String idField, String contentsField, Path segmentPath, long rowNumber) {
+    public Document(String id, String contents) {
       this.fields = new HashMap<>();
-      StringBuilder rawBuilder = new StringBuilder("{");
-      boolean firstField = true;
-      
-      // Always initialize ID to null first
-      this.id = null;
-
-      // Extract ID field - try the specified field first, then common alternatives
-      String[] idFieldCandidates = new String[]{idField, "docid", "doc_id", "document_id"};
-      boolean idFound = false;
-      for (String field : idFieldCandidates) {
-        try {
-          this.id = record.getString(field, 0);
-          if (!firstField) {
-            rawBuilder.append(",");
-          }
-          rawBuilder.append("\"").append(field).append("\":\"").append(escapeJson(id)).append("\"");
-          firstField = false;
-          idFound = true;
-          break;
-        } catch (RuntimeException ignored) {
-          // Field doesn't exist or is wrong type, try next
-        }
-      }
-      
-      // If ID not found, try to get any field that looks like an ID by checking all fields
-      if (!idFound) {
-        try {
-          int fieldCount = record.getType().getFieldCount();
-          for (int i = 0; i < fieldCount; i++) {
-            String fieldName = record.getType().getFieldName(i);
-            // Check if field name contains "id" (case insensitive)
-            if (fieldName.toLowerCase().contains("id")) {
-              try {
-                this.id = record.getString(i, 0);
-                if (!firstField) {
-                  rawBuilder.append(",");
-                }
-                rawBuilder.append("\"").append(fieldName).append("\":\"").append(escapeJson(id)).append("\"");
-                firstField = false;
-                idFound = true;
-                LOG.info("Found ID field: " + fieldName);
-                break;
-              } catch (RuntimeException ignored) {
-                // Not a string, try next
-              }
-            }
-          }
-        } catch (Exception e) {
-          LOG.warn("Error searching for ID field: " + e.getMessage());
-        }
-      }
-      
-      // If still not found, generate an ID based on segment path and row number
-      if (!idFound) {
-        String segmentName = segmentPath != null ? segmentPath.getFileName().toString().replace(".parquet", "") : "unknown";
-        this.id = segmentName + "_" + rowNumber;
-        // Insert ID at the beginning of the JSON
-        if (rawBuilder.length() > 1) {
-          rawBuilder.insert(1, "\"id\":\"" + escapeJson(this.id) + "\",");
-        } else {
-          rawBuilder.append("\"id\":\"").append(escapeJson(this.id)).append("\"");
-        }
-        firstField = false;
-        LOG.info("Auto-generated ID for document: " + this.id);
-      }
-      
-      // Extract contents field - try "text" first, then "contents", or use provided field
-      String[] contentsFieldCandidates = contentsField != null 
-          ? new String[]{contentsField}
-          : new String[]{"text", "contents", "content", "body"};
-      
-      for (String field : contentsFieldCandidates) {
-        try {
-          this.contents = record.getString(field, 0);
-          if (!firstField) {
-            rawBuilder.append(",");
-          }
-          rawBuilder.append("\"").append(field).append("\":\"").append(escapeJson(contents)).append("\"");
-          firstField = false;
-          break;
-        } catch (RuntimeException ignored) {
-          // Try next field
-        }
-      }
-
-      // Extract all other fields as metadata
-      try {
-        int fieldCount = record.getType().getFieldCount();
-        HashSet<String> processedFields = new HashSet<>();
-        if (id != null) {
-          processedFields.add(idField);
-        }
-        processedFields.addAll(Arrays.asList("text", "contents", "content", "body"));
-        if (contentsField != null) {
-          processedFields.add(contentsField);
-        }
-        
-        for (int i = 0; i < fieldCount; i++) {
-          String fieldName = record.getType().getFieldName(i);
-          
-          // Skip already processed fields
-          if (processedFields.contains(fieldName)) {
-            continue;
-          }
-
-          try {
-            // Try to extract as string
-            String value = record.getString(fieldName, 0);
-            this.fields.put(fieldName, value);
-            if (!firstField) {
-              rawBuilder.append(",");
-            }
-            rawBuilder.append("\"").append(fieldName).append("\":\"").append(escapeJson(value)).append("\"");
-            firstField = false;
-          } catch (RuntimeException e) {
-            // Field might not be a string type, skip it
-            LOG.debug("Skipping non-string field: " + fieldName);
-          }
-        }
-      } catch (Exception e) {
-        LOG.debug("Error extracting additional fields: " + e.getMessage());
-      }
-
-      rawBuilder.append("}");
-      this.raw = rawBuilder.toString();
-      
-      // Final safety check - ensure ID was set (should never be null at this point)
-      if (this.id == null || this.id.isEmpty()) {
-        String segmentName = segmentPath != null ? segmentPath.getFileName().toString().replace(".parquet", "") : "doc";
-        this.id = segmentName + "_" + rowNumber;
-        LOG.warn("Final safety fallback: Generated ID: " + this.id + " for row " + rowNumber);
-      }
-    }
-
-    /**
-     * Escape JSON string for raw output.
-     */
-    private String escapeJson(String str) {
-      if (str == null) {
-        return "";
-      }
-      return str.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t");
+      this.id = id;
+      this.contents = contents;
+      // For FineWeb, it's sufficient (and often desirable) for raw to just be the paragraph text.
+      this.raw = contents;
     }
 
     @Override
     public String id() {
-      if (id == null || id.isEmpty()) {
-        // Final fallback - generate ID from raw content hash if available
-        String fallbackId = "doc_" + (raw != null ? raw.hashCode() : System.currentTimeMillis());
-        LOG.warn("ID was null in id() method! Generated fallback ID: " + fallbackId);
-        this.id = fallbackId;
-        return fallbackId;
-      }
       return id;
     }
 
