@@ -23,8 +23,10 @@ import io.anserini.index.IndexReaderUtils;
 import io.anserini.search.query.VectorQueryGenerator;
 
 import org.apache.commons.lang3.time.DurationFormatUtils;
+import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.core.config.Configurator;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.search.IndexSearcher;
@@ -62,6 +64,9 @@ public class FlatDenseSearcher<K extends Comparable<K>> extends BaseSearcher<K> 
 
     @Option(name ="-encoder", metaVar = "[encoder]", usage = "Dense encoder to use.")
     public String encoder = null;
+
+    @Option(name = "-quiet", metaVar = "[boolean]", usage = "Turns off all logging (except for errors).")
+    public boolean quiet = false;
   }
 
   private final IndexReader reader;
@@ -73,9 +78,13 @@ public class FlatDenseSearcher<K extends Comparable<K>> extends BaseSearcher<K> 
   public FlatDenseSearcher(Args args) {
     super(args);
 
-    Path indexPath = IndexReaderUtils.getIndex(args.index);
+    if (args.quiet) {
+      // If quiet mode enabled, only report errors and above.
+      Configurator.setRootLevel(Level.ERROR);
+    }
 
     try {
+      Path indexPath = IndexReaderUtils.getIndex(args.index);
       this.reader = DirectoryReader.open(FSDirectory.open(indexPath));
     } catch (IOException e) {
       throw new IllegalArgumentException(String.format("\"%s\" does not appear to be a valid index.", args.index));
