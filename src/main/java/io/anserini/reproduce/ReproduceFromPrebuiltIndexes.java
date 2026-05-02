@@ -24,9 +24,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -42,6 +44,7 @@ import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import io.anserini.cli.CliUtils;
 
 import io.anserini.index.IndexReaderUtils;
+import io.anserini.util.CacheDirectoryResolver;
 import io.anserini.util.LoggingBootstrap;
 import io.anserini.util.PrebuiltIndexHandler;
 
@@ -165,9 +168,9 @@ public class ReproduceFromPrebuiltIndexes {
         if (PrebuiltIndexHandler.get(idx) != null) {
           // Prebuilt alias
           PrebuiltIndexHandler indexHandler = PrebuiltIndexHandler.get(idx);
-          if (indexHandler.getCompressedSize() > 0) {
-            downloadSizeStr = IndexReaderUtils.formatSize(indexHandler.getCompressedSize());
-            totalDownloadBytes += indexHandler.getCompressedSize();
+          if (indexHandler.getSize() > 0) {
+            downloadSizeStr = IndexReaderUtils.formatSize(indexHandler.getSize());
+            totalDownloadBytes += indexHandler.getSize();
           }
           Path prebuiltPath = expectedPrebuiltPath(idx);
           pathStr = prebuiltPath == null ? "-" : prebuiltPath.toAbsolutePath().toString();
@@ -332,6 +335,10 @@ public class ReproduceFromPrebuiltIndexes {
     final Instant endTime = Instant.now();
     final long durationMillis = endTime.toEpochMilli() - startTime.toEpochMilli();
 
+    if (!config.conditions.isEmpty()) {
+      System.out.print(renderSummaryTable(config));
+    }
+
     System.out.println("Start time: " + ReproductionUtils.formatStartTime(startTime));
     System.out.println("End time:   " + ReproductionUtils.formatEndTime(endTime));
     System.out.println("Duration:   " + ReproductionUtils.formatDuration(durationMillis));
@@ -351,7 +358,7 @@ public class ReproduceFromPrebuiltIndexes {
   private static Path expectedPrebuiltPath(String indexName) {
     try {
       PrebuiltIndexHandler handler = PrebuiltIndexHandler.get(indexName);
-      String cacheRoot = getCacheRoot();
+      String cacheRoot = CacheDirectoryResolver.getIndexCachePath().toString();
       String base = handler.getFilename();
       if (base.endsWith(".tar.gz")) {
         base = base.substring(0, base.length() - ".tar.gz".length());
@@ -390,21 +397,54 @@ public class ReproduceFromPrebuiltIndexes {
     return pathForSize;
   }
 
-  private static String getCacheRoot() {
-    String cacheDir = System.getProperty("anserini.index.cache");
-    if (cacheDir == null || cacheDir.isEmpty()) {
-      cacheDir = System.getenv("ANSERINI_INDEX_CACHE");
-    }
-    if (cacheDir == null || cacheDir.isEmpty()) {
-      cacheDir = java.nio.file.Path.of(System.getProperty("user.home"), ".cache", "pyserini", "indexes").toString();
-    }
-    return cacheDir;
-  }
-
   private static String repeat(char c, int n) {
     StringBuilder sb = new StringBuilder(n);
     for (int i = 0; i < n; i++) sb.append(c);
     return sb.toString();
+  }
+
+  static String renderSummaryTable(Config config) {
+    int conditionWidth = "condition".length();
+    int topicWidth = "topic".length();
+    int metricWidth = "metric".length();
+    int expectedWidth = "expected".length();
+
+    List<String[]> rows = new ArrayList<>();
+    for (Condition condition : config.conditions) {
+      for (Topic topic : condition.topics) {
+        for (Map.Entry<String, Double> entry : topic.expected_scores.entrySet()) {
+          String[] row = new String[] {
+              condition.name,
+              topic.topic_key,
+              entry.getKey(),
+              String.format(Locale.ROOT, "%.4f", entry.getValue())
+          };
+          rows.add(row);
+          conditionWidth = Math.max(conditionWidth, row[0].length());
+          topicWidth = Math.max(topicWidth, row[1].length());
+          metricWidth = Math.max(metricWidth, row[2].length());
+          expectedWidth = Math.max(expectedWidth, row[3].length());
+        }
+      }
+    }
+
+    String summaryFormat = "%-" + conditionWidth + "s  %-" + topicWidth + "s  %-" + metricWidth + "s  %" + expectedWidth + "s%n";
+    StringBuilder summary = new StringBuilder();
+    summary.append("Summary").append(System.lineSeparator());
+    summary.append(String.format(summaryFormat, "condition", "topic", "metric", "expected"));
+    summary.append(String.format(summaryFormat,
+      repeat('-', conditionWidth), repeat('-', topicWidth), repeat('-', metricWidth), repeat('-', expectedWidth)));
+
+    String previousCondition = null;
+    for (String[] row : rows) {
+      if (previousCondition != null && !row[0].equals(previousCondition)) {
+        summary.append(System.lineSeparator());
+      }
+      summary.append(String.format(summaryFormat, row[0], row[1], row[2], row[3]));
+      previousCondition = row[0];
+    }
+    summary.append(System.lineSeparator());
+    return summary.toString();
   }
 
   public static class Config {
